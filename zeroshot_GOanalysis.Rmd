@@ -1,0 +1,249 @@
+---
+title: "Zero Shot and GO analysis"
+author: "Timothy Mulderrig"
+date: "2026-04-14"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Install Packages
+```{r}
+library(vcfR) #install.packages("vcfR")
+library(here) #install.packages("here")
+library(ggplot2) #install.packages("ggplot2")
+library(httr) #install.packages("httr")
+library(jsonlite) #install.packages("jsonlite")
+library(xml2) #install.packages("xml2")
+library(readr) #install.packages("readr")
+library(devtools) #install.packages("devtools")
+install_github("TriticeaeToolbox/BrAPI.R")
+library(BrAPI)
+library(R.utils) #install.packages("R.utils")
+install.packages("BiocManager")
+BiocManager::install("biomaRt")
+library(biomaRt)
+```
+## Load Plant CAD Zero-Shot Output
+```{r}
+zero_shot <- vcfR::read.vcfR(here::here("zero_shot_4A.vcf"))
+```
+
+Now we need to extract the zero shot score estimates for each marker
+
+```{r}
+marker_info <- as.data.frame(zero_shot@fix) |> 
+  dplyr::mutate(zero_shot_score = as.numeric(sub(".*=","",INFO)))
+
+marker_info$VIDA <- filtered_vcf@gt[,"VIDA"]
+marker_info$YELLOWSTONE <- filtered_vcf@gt[,"YELLOWSTONE"]
+```
+
+Let's plot the distribution of zero-shot score estimates
+```{r}
+ggplot(data = marker_info)+
+  geom_histogram(aes(x=zero_shot_score), fill="darkgreen", color="black", bins = 30)+
+  labs(title="Distribution of Zero-Shot Scores of Chromosome 4A QTL Region SNPs", x="Zero-Shot Score", y= "Count")+
+  geom_vline(xintercept = quantile(marker_info$zero_shot_score,0.1), color="black", linetype= "dashed")+
+  annotate(
+    "text",
+    x = quantile(marker_info$zero_shot_score,0.1),
+    y = 750,             # adjust based on your histogram counts
+    label = stringr::str_wrap("10th percentile of zero-shot scores: -3.25",width = 50),
+    color = "black",
+    size = 4
+  )
+
+ggsave(here::here("zero_shot_score_dist.png"))
+
+marker_info$POS <- as.numeric(marker_info$POS)
+library(scales)
+ggplot(data = marker_info, aes(x=POS, y= zero_shot_score))+
+  geom_point(color="darkgreen")+
+  geom_hline(yintercept = 0, color="darkgrey")+
+  scale_x_continuous(
+    breaks = seq(620000000, 680000000, by = 10000000), 
+    labels = comma
+  )+
+  labs(title="Zero-Shot Scores of SNPs on Chromosome 4A", x="Position (bp)", y="Zero-shot Score")
+
+ggsave(here::here("zero_shot_scores_across_region.png"))
+
+```
+
+Now let's see what genes these SNPs are located nearby, especially for the SNPs with very negative zero-shot scores
+
+```{r functions to pull gene info}
+library(httr)
+library(readr)
+
+# Function to parse gene IDs and positions from GFF content
+parse_gff_content <- function(gff_content) {
+  lines <- strsplit(gff_content, "\n")[[1]]
+  
+  # Keep only lines describing genes
+  gene_lines <- grep("\tgene\t", lines, value = TRUE)
+  if (length(gene_lines) == 0) return(NULL)
+  
+  # Extract gene IDs from attributes column
+  gene_id <- sub(".*?ID=gene:(.*?);.*", "\\1", gene_lines)
+  
+  # Extract start and end positions (columns 4 and 5 in GFF)
+  gene_start <- as.numeric(sapply(strsplit(gene_lines, "\t"), `[`, 4))
+  gene_end   <- as.numeric(sapply(strsplit(gene_lines, "\t"), `[`, 5))
+  
+  data.frame(
+    candidate_gene = gene_id,
+    gene_start = gene_start,
+    gene_end   = gene_end,
+    stringsAsFactors = FALSE
+  )
+}
+
+extract_genes_from_regions <- function(region_df, species, output_file, chunk_size = 1e6) {
+  
+  server <- "https://rest.ensembl.org"
+  
+  all_genes <- data.frame(
+    chrom = character(),
+    region_start = integer(),
+    region_end   = integer(),
+    candidate_gene = character(),
+    gene_start = integer(),
+    gene_end   = integer(),
+    stringsAsFactors = FALSE
+  )
+  
+  region_df$start_bp <- as.numeric(region_df$start_bp)
+  region_df$end_bp   <- as.numeric(region_df$end_bp)
+  
+  for (i in seq_len(nrow(region_df))) {
+    chrom <- region_df$chrom[i]
+    start_bp <- region_df$start_bp[i]
+    end_bp   <- region_df$end_bp[i]
+    
+    # Split into chunks
+    chunk_starts <- seq(start_bp, end_bp, by = chunk_size)
+    chunk_ends   <- pmin(chunk_starts + chunk_size - 1, end_bp)
+    
+    for (j in seq_along(chunk_starts)) {
+      query_start <- chunk_starts[j]
+      query_end   <- chunk_ends[j]
+      
+      ext <- paste0("/overlap/region/", species, "/", chrom, ":",
+                    sprintf("%d", query_start), "-",
+                    sprintf("%d", query_end),
+                    "?feature=gene")
+      url <- paste0(server, ext)
+      message("Querying: ", url)
+      
+      res <- GET(url, content_type("text/x-gff3"))
+      
+      if (status_code(res) != 200) {
+        warning("Skipping chunk: ", url, " (status ", status_code(res), ")")
+        next
+      }
+      
+      gff_content <- content(res, "text")
+      genes_df <- parse_gff_content(gff_content)
+      
+      # Only proceed if genes_df is not NULL and has rows
+      if (!is.null(genes_df) && nrow(genes_df) > 0) {
+        genes_df$chrom <- chrom
+        genes_df$region_start <- query_start
+        genes_df$region_end   <- query_end
+        
+        all_genes <- rbind(all_genes, genes_df[, c("chrom", "region_start", "region_end",
+                                                   "candidate_gene", "gene_start", "gene_end")])
+      }
+    }
+  }
+  
+  # Remove duplicate genes
+  all_genes <- all_genes[!duplicated(all_genes$candidate_gene), ]
+  
+  write_csv(all_genes, output_file)
+  message("Saved ", nrow(all_genes), " genes to ", output_file)
+}
+```
+
+```{r}
+region_df <- data.frame(
+  chrom = "chr4A",
+  start_bp = min(marker_info$POS),
+  end_bp   = max(marker_info$POS)
+)
+
+extract_genes_from_regions(region_df, 
+                           species = "Triticum_aestivum", 
+                           output_file = here::here("region_genes_4A.csv"))
+
+```
+
+```{r}
+region_genes_4A <- readr::read_csv(here::here("region_genes_4A.csv"))
+mart <- useMart("plants_mart", dataset="taestivum_eg_gene", host="https://plants.ensembl.org")
+genes_of_interest <- unique(region_genes_4A$candidate_gene)
+go_data <- getBM(attributes=c("ensembl_gene_id","start_position","end_position","go_id","name_1006","namespace_1003"), filters = c("ensembl_gene_id"), values = c(genes_of_interest) ,mart=mart) 
+
+go_data <- go_data |> 
+  dplyr::filter(nchar(go_id)>0)
+
+get_go_definitions <- function(go_ids) {
+  go_term_defs <- data.frame(NULL)
+  
+  for (go_id in go_ids){  
+    server <- "https://rest.ensembl.org/ontology/id/"
+
+    result <- tryCatch({
+      r <- GET(paste(server, go_id, sep = ""), 
+               content_type("application/json"))
+
+      stop_for_status(r)
+
+      res <- fromJSON(toJSON(content(r)))
+      data.frame(
+        go_id = res$accession, 
+        go_name = res$name, 
+        go_definition = res$definition
+      )
+      
+    }, error = function(e) {
+      message(paste("Skipping:", go_id))
+      return(NULL)
+    })
+    
+    # only append if successful
+    if (!is.null(result)) {
+      go_term_defs <- rbind(go_term_defs, result)
+    }
+  }
+  
+  return(go_term_defs)
+}
+
+go_defs <- get_go_definitions(unique(go_data$go_id))
+
+go_data_full <- go_data |> 
+  dplyr::left_join(go_defs, by = "go_id") 
+```
+
+Now we just need to append the GO data to our SNP data with Zero-Shot scores by alligning SNP position to gene start and stop position
+
+
+```{r}
+go_data_for_parent_snps <-  marker_info |> 
+  dplyr::left_join(
+    go_data_full,
+    by = dplyr::join_by(
+      POS >= start_position,
+      POS <= end_position
+    )
+  ) |> 
+  dplyr::select(CHROM,POS,ID,REF,ALT,VIDA,YELLOWSTONE,INFO,zero_shot_score,ensembl_gene_id,start_position,end_position,go_id,name_1006,namespace_1003,go_name,go_definition)
+
+write.csv(go_data_for_parent_snps, here::here("parent_SNP_GOterms_ZeroShot.csv"), row.names = FALSE)
+```
+

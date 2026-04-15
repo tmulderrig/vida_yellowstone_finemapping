@@ -1,0 +1,81 @@
+---
+title: "genotype_data_pull"
+author: "Timothy Mulderrig"
+date: "2026-04-14"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Install Packages
+```{r}
+library(vcfR) #install.packages("vcfR")
+library(here) #install.packages("here")
+library(ggplot2) #install.packages("ggplot2")
+library(httr) #install.packages("httr")
+library(jsonlite) #install.packages("jsonlite")
+library(xml2) #install.packages("xml2")
+library(readr) #install.packages("readr")
+library(devtools) #install.packages("devtools")
+install_github("TriticeaeToolbox/BrAPI.R")
+library(BrAPI)
+library(R.utils) #install.packages("R.utils")
+```
+
+## Introduction
+
+The following script outlines steps to pull all of the necessary input data to run the Zero-Shot Score Analysis using the [Plant Caduceus Pretrained Model](https://github.com/plantcad/plantcad/tree/main?tab=readme-ov-file#plantcad-overview). This is useful for fine-mapping project, as zero-shot scores predict variant effect estimates for SNPs between our parents, which vary for our trait of interest. This data, in conjunction with gene annotations and related Gene Onotology (GO) terms from [Ensembl Plants](https://plants.ensembl.org/biomart/martview/69919ddf26b0f561ffc107f4f7df0abf) can be used to inform hypotheses regarding causality of candidate genes. 
+
+As inputs for the Zero-Shot Analysis, we must prepare a VCF file with marker information for our parents and pull reference genome sequence. We will pull our genotype data from [T3 Wheat](https://wheat.triticeaetoolbox.org/) using BrAPI.R and the reference sequence for Chinese Spring from IWGSC.
+
+## Pull Parent SNP Data
+
+```{r}
+conn <- createBrAPIConnection("wheat.triticeaetoolbox.org", is_breedbase = TRUE)
+
+parent_names <- c("VIDA", "YELLOWSTONE")
+
+vida_geno_projects <- conn$wizard("genotyping_projects", list(accessions = "VIDA"))
+yellowstone_geno_projects <- conn$wizard("genotyping_projects", list(accessions = "YELLOWSTONE"))
+
+intersect(vida_geno_projects$data$names,yellowstone_geno_projects$data$names)
+selected_geno_proj <- as.character(intersect(vida_geno_projects$data$ids,yellowstone_geno_projects$data$ids))
+
+selected_protocol <- conn$wizard("genotyping_protocols", list(genotyping_projects = selected_geno_proj))$data$ids
+
+conn$vcf_archived(here::here("HapMap2019.vcf"), genotyping_project_id = selected_geno_proj)
+conn$vcf(here::here("vida_yellowstone.vcf"), genotyping_protocol_id = selected_protocol, accessions = parent_names)
+```
+The file from the genotyping project is quite large and contains a lot of data that we do not need. We will filter this data to contain only data for our 2 parents, Vida and Yellowstone, and retain only markers within our QTL region. 
+
+```{r}
+raw_parent_snps <- vcfR::read.vcfR(here::here("parent_region_snps_raw.vcf"))
+```
+
+From this raw data, we need to remove monomorphic SNPs, SNPs where either parent are NA, and indels.
+
+```{r}
+parent_snps_fix <- as.data.frame(raw_parent_snps@fix)
+parent_snps_gt <- as.data.frame(raw_parent_snps@gt)
+
+rows_to_remove <-  which(nchar(parent_snps_fix$ALT) != 1 | nchar(parent_snps_fix$REF) != 1 | is.na(parent_snps_gt$YELLOWSTONE) | is.na(parent_snps_gt$VIDA) | parent_snps_gt$YELLOWSTONE==parent_snps_gt$VIDA)
+
+filtered_vcf <- raw_parent_snps[-rows_to_remove,]
+
+filtered_vcf@fix <- as.data.frame(filtered_vcf@fix) |> 
+  dplyr::mutate(CHROM = paste0("chr", CHROM)) |> 
+  as.matrix()
+
+vcfR::write.vcf(filtered_vcf, here::here("filtered_vida_yellowstone_snps.vcf"))
+```
+
+Now we need to pull the reference genome sequence from chromosome 4A
+```{r}
+download.file(url = "https://urgi.versailles.inrae.fr/download/iwgsc/IWGSC_RefSeq_Assemblies/v1.0/iwgsc_refseqv1.0_chr4A.fsa.zip",
+              destfile = here::here("refseq_chr4A.fsa.zip"))
+
+refseq <- read.table(here::here("iwgsc_refseqv1.0_chr4A.fsa"))
+```
+
